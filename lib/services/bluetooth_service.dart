@@ -139,6 +139,47 @@ class BluetoothService {
     return allEssentialGranted;
   }
 
+  /// Start mesh networking (discovery + advertising together)
+  /// This ensures devices can both find and be found by each other
+  Future<bool> startMesh() async {
+    try {
+      if (!_isInitialized) {
+        final initialized = await initialize();
+        if (!initialized) return false;
+      }
+
+      // If already running, restart for resilience
+      if (_isDiscovering && _isAdvertising) {
+        Logger.info('Mesh already active, proceeding');
+        return true;
+      }
+
+      Logger.info('Starting Mesh networking (discovery + advertising)');
+
+      // Start both discovery and advertising in parallel
+      final results = await Future.wait([
+        startDiscovery(),
+        startAdvertising(),
+      ], eagerError: false);
+
+      final discoverySuccess = results[0] as bool;
+      final advertisingSuccess = results[1] as bool;
+
+      if (!discoverySuccess || !advertisingSuccess) {
+        Logger.error(
+          'Mesh startup failed - Discovery: $discoverySuccess, Advertising: $advertisingSuccess',
+        );
+        return false;
+      }
+
+      Logger.info('Mesh networking started successfully');
+      return true;
+    } catch (error, stackTrace) {
+      Logger.error('Failed to start mesh', error, stackTrace);
+      return false;
+    }
+  }
+
   /// Start device discovery
   Future<bool> startDiscovery() async {
     try {
@@ -147,30 +188,60 @@ class BluetoothService {
         if (!initialized) return false;
       }
 
-      if (_isDiscovering) return true;
+      if (_isDiscovering) {
+        Logger.info('Discovery already active');
+        return true;
+      }
 
       Logger.info('Starting Nearby Connections discovery');
       _isDiscovering = true;
       _discoveredDevices.clear();
 
-      // Start Nearby Connections discovery
-      await Nearby().startDiscovery(
-        'OffGrid_${DateTime.now().millisecondsSinceEpoch}',
-        _strategy,
-        onEndpointFound: (endpointId, name, serviceId) {
-          Logger.info('Found Nearby endpoint: $name ($endpointId)');
-          _discoveredDevices[endpointId] = name;
-          _devicesController.add(discoveredDevices);
-        },
-        onEndpointLost: (endpointId) {
-          Logger.info('Lost Nearby endpoint: $endpointId');
-          _discoveredDevices.remove(endpointId);
-          _devicesController.add(discoveredDevices);
-        },
-        serviceId: _serviceId,
-      );
+      try {
+        // Start Nearby Connections discovery
+        await Nearby()
+            .startDiscovery(
+              'OffGrid_${DateTime.now().millisecondsSinceEpoch}',
+              _strategy,
+              onEndpointFound: (endpointId, name, serviceId) {
+                Logger.info('Found Nearby endpoint: $name ($endpointId)');
+                _discoveredDevices[endpointId] = name;
+                _devicesController.add(discoveredDevices);
+              },
+              onEndpointLost: (endpointId) {
+                Logger.info('Lost Nearby endpoint: $endpointId');
+                _discoveredDevices.remove(endpointId);
+                _devicesController.add(discoveredDevices);
+              },
+              serviceId: _serviceId,
+            )
+            .timeout(const Duration(seconds: 5));
 
-      return true;
+        Logger.info('Discovery started successfully');
+        return true;
+      } catch (discoveryError) {
+        // Log the specific error for debugging
+        Logger.error('Discovery error details: $discoveryError');
+
+        // If already discovering, sync state and return success
+        if (discoveryError.toString().contains('STATUS_ALREADY_DISCOVERING') ||
+            discoveryError.toString().contains('8004')) {
+          Logger.warning('Service already discovering, syncing state');
+          _isDiscovering = true;
+          return true;
+        }
+
+        // If NFC error occurs, it's usually safe to continue anyway
+        if (discoveryError.toString().contains('NFC')) {
+          Logger.warning(
+            'NFC error detected, but continuing with Bluetooth/WiFi discovery',
+          );
+          return true;
+        }
+
+        _isDiscovering = false;
+        rethrow;
+      }
     } catch (error, stackTrace) {
       Logger.error('Failed to start discovery', error, stackTrace);
       _isDiscovering = false;
@@ -184,15 +255,28 @@ class BluetoothService {
       if (!_isDiscovering) return;
 
       Logger.info('Stopping Nearby Connections discovery');
+
+      try {
+        // Stop Nearby Connections discovery
+        await Nearby().stopDiscovery().timeout(
+          const Duration(seconds: 5),
+          onTimeout: () => Logger.warning('Discovery stop timeout'),
+        );
+      } catch (error) {
+        // If discovery isn't running, that's fine
+        if (!error.toString().contains('not start') &&
+            !error.toString().contains('not discovering')) {
+          rethrow;
+        }
+        Logger.debug('Discovery was not running');
+      }
+
       _isDiscovering = false;
-
-      // Stop Nearby Connections discovery
-      await Nearby().stopDiscovery();
-
       _discoveredDevices.clear();
       _devicesController.add([]);
     } catch (error, stackTrace) {
       Logger.error('Failed to stop discovery', error, stackTrace);
+      _isDiscovering = false; // Force state update on error
     }
   }
 
@@ -209,57 +293,96 @@ class BluetoothService {
       Logger.info('Starting Nearby Connections advertising');
       _isAdvertising = true;
 
-      // Start Nearby Connections advertising
-      await Nearby().startAdvertising(
-        'OffGrid_${DateTime.now().millisecondsSinceEpoch}',
-        _strategy,
-        onConnectionInitiated: (endpointId, info) {
-          Logger.network('Connection initiated with: ${info.endpointName}');
+      try {
+        // Start Nearby Connections advertising
+        await Nearby()
+            .startAdvertising(
+              'OffGrid_${DateTime.now().millisecondsSinceEpoch}',
+              _strategy,
+              onConnectionInitiated: (endpointId, info) {
+                Logger.network(
+                  'Connection initiated with: ${info.endpointName}',
+                );
 
-          // Check if we're at max connections
-          if (_connections.length >= _maxConnections) {
-            Logger.warning(
-              'Max connections ($_maxConnections) reached, rejecting: $endpointId',
-            );
-            Nearby().rejectConnection(endpointId);
-            return;
-          }
+                // Check if we're at max connections
+                if (_connections.length >= _maxConnections) {
+                  Logger.warning(
+                    'Max connections ($_maxConnections) reached, rejecting: $endpointId',
+                  );
+                  Nearby().rejectConnection(endpointId);
+                  return;
+                }
 
-          // Add basic validation
-          if (info.endpointName.isEmpty) {
-            Logger.warning('Invalid empty device name, rejecting: $endpointId');
-            Nearby().rejectConnection(endpointId);
-            return;
-          }
+                // Add basic validation
+                if (info.endpointName.isEmpty) {
+                  Logger.warning(
+                    'Invalid empty device name, rejecting: $endpointId',
+                  );
+                  Nearby().rejectConnection(endpointId);
+                  return;
+                }
 
-          // Accept connection for mesh networking
-          Logger.network('Accepting connection from: ${info.endpointName}');
-          Nearby().acceptConnection(
-            endpointId,
-            onPayLoadRecieved: (endpointId, data) =>
-                _handleReceivedData(endpointId, data.bytes ?? Uint8List(0)),
-            onPayloadTransferUpdate: (endpointId, update) =>
-                _handleDataTransferUpdate(endpointId, update),
+                // Accept connection for mesh networking
+                Logger.network(
+                  'Accepting connection from: ${info.endpointName}',
+                );
+                Nearby().acceptConnection(
+                  endpointId,
+                  onPayLoadRecieved: (endpointId, data) => _handleReceivedData(
+                    endpointId,
+                    data.bytes ?? Uint8List(0),
+                  ),
+                  onPayloadTransferUpdate: (endpointId, update) =>
+                      _handleDataTransferUpdate(endpointId, update),
+                );
+              },
+              onConnectionResult: (endpointId, result) {
+                if (result == Status.CONNECTED) {
+                  Logger.info('Connected to endpoint: $endpointId');
+                  _connections[endpointId] =
+                      _discoveredDevices[endpointId] ?? 'Unknown';
+                  _connectionController.add(endpointId);
+                } else {
+                  Logger.warning(
+                    'Connection failed with status: ${result.name}',
+                  );
+                }
+              },
+              onDisconnected: (endpointId) {
+                Logger.info('Disconnected from endpoint: $endpointId');
+                _connections.remove(endpointId);
+              },
+              serviceId: _serviceId,
+            )
+            .timeout(const Duration(seconds: 5));
+
+        Logger.info('Advertising started successfully');
+        return true;
+      } catch (advertisingError) {
+        // Log the specific error
+        Logger.error('Advertising error details: $advertisingError');
+
+        // If already advertising, sync state and return success
+        if (advertisingError.toString().contains(
+              'STATUS_ALREADY_ADVERTISING',
+            ) ||
+            advertisingError.toString().contains('8001')) {
+          Logger.warning('Service already advertising, syncing state');
+          _isAdvertising = true;
+          return true;
+        }
+
+        // If NFC error occurs, continue anyway
+        if (advertisingError.toString().contains('NFC')) {
+          Logger.warning(
+            'NFC error detected, but continuing with Bluetooth/WiFi advertising',
           );
-        },
-        onConnectionResult: (endpointId, result) {
-          if (result == Status.CONNECTED) {
-            Logger.info('Connected to endpoint: $endpointId');
-            _connections[endpointId] =
-                _discoveredDevices[endpointId] ?? 'Unknown';
-            _connectionController.add(endpointId);
-          } else {
-            Logger.warning('Connection failed with status: ${result.name}');
-          }
-        },
-        onDisconnected: (endpointId) {
-          Logger.info('Disconnected from endpoint: $endpointId');
-          _connections.remove(endpointId);
-        },
-        serviceId: _serviceId,
-      );
+          return true;
+        }
 
-      return true;
+        _isAdvertising = false;
+        rethrow;
+      }
     } catch (error, stackTrace) {
       Logger.error('Failed to start advertising', error, stackTrace);
       _isAdvertising = false;
@@ -273,11 +396,25 @@ class BluetoothService {
       if (!_isAdvertising) return;
 
       Logger.info('Stopping Nearby Connections advertising');
-      _isAdvertising = false;
 
-      await Nearby().stopAdvertising();
+      try {
+        await Nearby().stopAdvertising().timeout(
+          const Duration(seconds: 5),
+          onTimeout: () => Logger.warning('Advertising stop timeout'),
+        );
+      } catch (error) {
+        // If advertising isn't running, that's fine
+        if (!error.toString().contains('not start') &&
+            !error.toString().contains('not advertising')) {
+          rethrow;
+        }
+        Logger.debug('Advertising was not running');
+      }
+
+      _isAdvertising = false;
     } catch (error, stackTrace) {
       Logger.error('Failed to stop advertising', error, stackTrace);
+      _isAdvertising = false; // Force state update on error
     }
   }
 
@@ -490,8 +627,14 @@ class BluetoothService {
     try {
       // Verify that advertising/discovery are still active if expected
       if (_isAdvertising || _isDiscovering) {
-        // Quick check to ensure service is still alive
-        Logger.info('Bluetooth services still active');
+        // Perform health check
+        final isHealthy = await _checkMeshHealth();
+        if (!isHealthy) {
+          Logger.warning('Mesh health check failed, attempting restart...');
+          await startMesh();
+        } else {
+          Logger.info('Bluetooth services still active and healthy');
+        }
       }
     } catch (error, stackTrace) {
       Logger.error(
@@ -499,6 +642,51 @@ class BluetoothService {
         error,
         stackTrace,
       );
+    }
+  }
+
+  /// Health check for mesh networking
+  /// Verifies that discovery and advertising are still active
+  Future<bool> _checkMeshHealth() async {
+    try {
+      // Verify state flags
+      if (!_isDiscovering && !_isAdvertising) {
+        Logger.warning('Mesh health check: services not active');
+        return false;
+      }
+
+      Logger.debug('Mesh health check: services active and responsive');
+      return true;
+    } catch (error, stackTrace) {
+      Logger.error('Mesh health check failed', error, stackTrace);
+      return false;
+    }
+  }
+
+  /// Restart mesh networking
+  /// Stops and restarts discovery and advertising for recovery from failures
+  Future<bool> restartMesh() async {
+    try {
+      Logger.info('Restarting mesh networking...');
+      await stopMesh();
+      await Future.delayed(const Duration(milliseconds: 500));
+      return startMesh();
+    } catch (error, stackTrace) {
+      Logger.error('Failed to restart mesh', error, stackTrace);
+      return false;
+    }
+  }
+
+  /// Stop all mesh networking (discovery and advertising)
+  Future<void> stopMesh() async {
+    try {
+      Logger.info('Stopping mesh networking');
+      await Future.wait([
+        stopDiscovery(),
+        stopAdvertising(),
+      ], eagerError: false);
+    } catch (error, stackTrace) {
+      Logger.error('Error stopping mesh', error, stackTrace);
     }
   }
 

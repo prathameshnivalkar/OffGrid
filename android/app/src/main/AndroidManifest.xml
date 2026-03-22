@@ -27,6 +27,9 @@
     
     <!-- Internet (for debugging and updates, not required for mesh functionality) -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Make NFC optional to prevent discovery failures on devices without it -->
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
     
     <application
         android:label="OffGrid Messenger"
